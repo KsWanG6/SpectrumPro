@@ -11,6 +11,9 @@ from .core import Spectrum
 # ------------------------------------------------------------------ tolerant reading
 def _read_text(path):
     raw = open(path, "rb").read()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):                   # UTF-16 with BOM (some UV-Vis software)
+        try: return raw.decode("utf-16")
+        except UnicodeDecodeError: pass
     for enc in ("utf-8-sig", "cp950", "cp936", "latin-1"):
         try: return raw.decode(enc)
         except UnicodeDecodeError: continue
@@ -24,6 +27,11 @@ def _numeric_rows(text):
         s = line.strip()
         if not s or s[0] in "#%":
             continue
+        if "\t" in line:                                        # tab-separated: an empty cell is an empty column, not nothing
+            cells = [c.strip() for c in line.rstrip("\r\n").split("\t")]
+            if any(cells):
+                try: rows.append([float(c) if c else np.nan for c in cells]); continue
+                except ValueError: pass
         parts = s.replace(",", " ").replace(";", " ").split()
         if not parts: continue                                  # e.g. ",,"
         try: vals = [float(p) for p in parts]
@@ -49,9 +57,10 @@ def parse_header(text, width):
         if not parts: continue
         try: [float(p) for p in parts]; break                   # first numeric row -> header is over
         except ValueError: last_text.append(s)
+    kv_style = width == 2 and sum(len(_split_labels(s)) == 2 for s in last_text) > 2     # many "key,value" lines (Edinburgh FS5/FLS): no column-title line
     for s in last_text:
         f = [t for t in _split_labels(s)]
-        if len(f) == width and all(t for t in f): labels = f
+        if len(f) == width and not kv_style and (all(t for t in f) or (width >= 3 and f[0] and sum(map(bool, f)) >= 2)): labels = f   # empty titles allowed for blank columns
         elif len(f) >= 2 and f[0] and f[1] and not any(t for t in f[2:]): meta[f[0]] = f[1]
     return labels, meta
 
@@ -66,7 +75,20 @@ def _axis_info(labels):
     return xu
 
 
+def _unit_of(label):
+    """Y quantity named by a column title, e.g. '0.5M(Abs)' -> Absorbance, 'Sample (%T)' -> Transmittance (%); None if not recognisable."""
+    t = label.lower().replace(" ", "")
+    m = re.search(r"[(\[]([^)\]]*)[)\]]$", t)
+    u = m.group(1) if m else t
+    if u in ("abs", "a", "absorbance", "od") or u.startswith("abs"): return "Absorbance"
+    if u in ("%t", "t%", "transmittance", "trans") or u.startswith("trans"): return "Transmittance (%)"
+    if u in ("%r", "r%", "reflectance", "refl") or u.startswith("refl"): return "Reflectance (%)"
+    return None
+
+
 def _quantity(label):
+    u = _unit_of(label)
+    if u: return u
     t = label.lower().replace(" ", "")
     if t.startswith("abs") or t in ("a", "absorbance"): return "Absorbance"
     if "%t" in t or t.startswith("trans"): return "Transmittance (%)"
@@ -110,7 +132,25 @@ def load_spectra(path, base=None):
     if skipped: pre.append(f"略過 {skipped} 行非數字文字（標題或說明）")
     if len(rows) != n_all: pre.append(f"略過 {n_all - len(rows)} 列欄數不一致的資料")
     labels, meta = parse_header(_read_text(path), width)
+    keep = ~np.all(np.isnan(d), axis=0)                           # columns with no data at all (blank column between samples)
+    if not keep.all():
+        d = d[:, keep]
+        if labels: labels = [l for l, k_ in zip(labels, keep) if k_]
+        width = d.shape[1]
+        pre.append(f"略過 {int((~keep).sum())} 個空白欄")
+        if width < 2: raise ValueError("至少需要兩欄（X、Y）")
     xunit = _axis_info(labels)
+    ir_tag = None                                                 # JASCO / generic FT-IR export: "XUNITS 1/CM", "YUNITS TRANSMITTANCE"
+    mu = {k.strip().upper(): v.strip().upper() for k, v in meta.items()}
+    if width == 2 and (mu.get("XUNITS", "").replace(" ", "") in ("1/CM", "CM-1", "CM^-1") or "INFRARED" in mu.get("DATA TYPE", "")):
+        yu = mu.get("YUNITS", "")
+        ir_tag = "T" if "TRANS" in yu else ("A" if "ABS" in yu else None)
+        xunit = "cm-1"
+        if ir_tag is None:
+            from . import ir as _ir
+            ir_tag = _ir.guess_mode(d[:, 1])
+    if not xunit and meta.get("Xaxis"):                            # Edinburgh/FLS-style "Xaxis,Wavelength" header (photoluminescence)
+        xunit = _axis_info([meta["Xaxis"]])
     if width >= 3 and (labels or width % 2 == 1):                  # X, Y1, Y2, ... (shared X; e.g. GENESYS: wavelength, ABS, %T)
         pairs = [(d[:, 0], d[:, k], (labels[k] if labels else f"Y{k}")) for k in range(1, width)]
     elif width >= 4 and width % 2 == 0:                             # x1 y1 x2 y2 ...
@@ -129,11 +169,16 @@ def load_spectra(path, base=None):
         nm = base if len(pairs) == 1 else (f"{base}_{lb}" if lb else f"{base}_{k + 1}")
         s = Spectrum(xx, yy, nm)
         s.history = [f"import({os.path.basename(path)})"] + ([f"xunit={xunit}"] if xunit else []) + [f"import-note: {n}" for n in pre + notes]
+        if ir_tag: s.history.append(f"ir={ir_tag}")
         if meta: s.history.append("import-note: 檔頭 " + ", ".join(f"{a}={b}" for a, b in meta.items()))
-        s.meta = {"xunit": xunit, "ylabel": _quantity(lb) if lb else None, "hidden": len(pairs) > 1 and k != prim and bool(labels)}
+        q, q0 = (_unit_of(lb) if lb else None), (_unit_of(pairs[prim][2]) if pairs[prim][2] else None)
+        other_axis = k != prim and bool(labels) and q is not None and q0 is not None and q != q0     # a different Y quantity (e.g. %T next to Abs) is kept but hidden
+        s.meta = {"xunit": xunit, "ylabel": ({"T": "Transmittance (%)", "A": "Absorbance"}[ir_tag] if ir_tag else (_quantity(lb) if lb else None)), "ir": ir_tag, "hidden": len(pairs) > 1 and (other_axis if q0 else k != prim and bool(labels))}
         nts = pre + notes
-        if k == 0 and labels and width >= 3: nts = [f"偵測到檔頭欄位：{' / '.join(labels)}，已拆成 {len(pairs)} 條光譜（預設只顯示 {pairs[prim][2]}）"] + nts
+        if k == 0 and labels and width >= 3: nts = [f"偵測到檔頭欄位：{' / '.join(labels)}，已拆成 {len(pairs)} 條光譜"] + nts
         out.append((s, nts))
+    if out and labels and width >= 3 and any(sp.meta["hidden"] for sp, _ in out):
+        out[0][1][0] += f"（Y 軸量不同者先隱藏，預設顯示 {pairs[prim][2]}）"
     return out
 
 

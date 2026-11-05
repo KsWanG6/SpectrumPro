@@ -21,3 +21,4 @@ from . import peakanalysis
 from . import qc
 
 from . import safeio
+from . import ir

@@ -35,6 +35,55 @@ class Item:
         self.stage = {}           # {"smooth": Spectrum, "base": (x, y), "pre_base": Spectrum}
 
 
+class WheelStrip(W.QScrollArea):
+    """Holds the main toolbar at its full width; when the window is narrower, the wheel (over the strip) scrolls it sideways - no scrollbar."""
+    def __init__(self, inner):
+        super().__init__()
+        self.setWidget(inner); self.setWidgetResizable(False); self.setFrameShape(W.QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(C.Qt.ScrollBarAlwaysOff); self.setVerticalScrollBarPolicy(C.Qt.ScrollBarAlwaysOff)
+        self.setSizePolicy(W.QSizePolicy.Expanding, W.QSizePolicy.Fixed)
+        self.setFixedHeight(inner.height() + 2); self.setMinimumWidth(60)
+        self.setStyleSheet("QScrollArea{background:transparent}")
+        inner.setAutoFillBackground(False)
+        for o in [inner] + inner.findChildren(W.QWidget): o.installEventFilter(self)      # wheel over any button / gap scrolls the strip
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == C.QEvent.Wheel:
+            self.wheelEvent(ev); return ev.isAccepted()
+        return False
+
+    def fit(self):
+        """Give the inner toolbar the full width of all its buttons (summed explicitly, so nothing falls into an overflow menu)."""
+        tb = self.widget(); lay = tb.layout()
+        if lay: lay.invalidate(); lay.activate()
+        total, h = 0, 0
+        for a in tb.actions():
+            w = tb.widgetForAction(a)
+            if w is not None and w.isVisibleTo(tb) or (w is not None and a.isVisible()):
+                total += max(w.width(), w.sizeHint().width()); h = max(h, w.height(), w.sizeHint().height())
+            elif a.isSeparator(): total += 12
+        sp = (lay.spacing() if lay and lay.spacing() >= 0 else 4) * max(len(tb.actions()) - 1, 0)
+        m = tb.contentsMargins(); total += sp + m.left() + m.right() + 24
+        h = max(h + m.top() + m.bottom() + 16, tb.sizeHint().height() + 8)           # generous: label descenders must never be clipped
+        btns = [b for b in tb.findChildren(W.QToolButton) if b.objectName() != "qt_toolbar_ext_button"]
+        bh = max([b.height() for b in btns] + [b.sizeHint().height() for b in btns] + [0]) + 4
+        for b in btns: b.setFixedHeight(bh)                               # every button the same height (layout audit relies on it)
+        h = max(h, bh + m.top() + m.bottom() + 12)
+        tb.setFixedSize(max(total, tb.sizeHint().width()), h)
+        h = max([h] + [tb.widgetForAction(a).height() + m.top() + m.bottom() + 12 for a in tb.actions() if tb.widgetForAction(a) is not None])
+        tb.setFixedSize(tb.width(), h); self.setFixedHeight(h + 4); self.updateGeometry()
+
+    def sizeHint(self):
+        return C.QSize(self.widget().width() + 2, self.widget().height() + 2)
+
+    def wheelEvent(self, ev):
+        bar = self.horizontalScrollBar()
+        d = ev.angleDelta(); step = d.x() or d.y()
+        if bar.maximum() > 0 and step:
+            bar.setValue(bar.value() - step); ev.accept()
+        else: ev.ignore()
+
+
 class MainWindow(W.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -192,6 +241,8 @@ class MainWindow(W.QMainWindow):
         self._build_processing_tab()
         self._build_analysis_tab()
         self._build_display_tab()
+        from .ir_panel import IrPanel
+        self.ir = IrPanel(self); self.panel.addTab(self.ir, "IR 紅外")
         right = W.QDockWidget("", self); right.setTitleBarWidget(W.QWidget()); right.setWidget(self.panel)
         right.setFeatures(W.QDockWidget.NoDockWidgetFeatures); self.right_dock = right
         self.addDockWidget(C.Qt.RightDockWidgetArea, right)
@@ -547,6 +598,7 @@ class MainWindow(W.QMainWindow):
 
     def default_xlabel(self):
         if getattr(self, "axis_mode", "shift") == "nm": return "Wavelength (nm)"
+        if self.items and all(any(h.startswith("ir=") for h in it.spec.history) for it in self.items): return "Wavenumber (cm⁻¹)"
         nm = [it for it in self.items if "xunit=nm" in it.spec.history]
         return "Wavelength (nm)" if nm and len(nm) == len(self.items) else "Raman Shift (cm⁻¹)"
 
@@ -713,7 +765,8 @@ class MainWindow(W.QMainWindow):
 
     # ---------------- toolbar ----------------
     def _build_toolbar(self):
-        tb = self.addToolBar("常用"); tb.setMovable(False); tb.setIconSize(C.QSize(40, 40))
+        outer = self.addToolBar("常用"); outer.setMovable(False); outer.setObjectName("MainToolBar")
+        tb = W.QToolBar("常用"); tb.setMovable(False); tb.setIconSize(C.QSize(40, 40))        # lives inside a wheel-scrollable strip
         tb.setToolButtonStyle(C.Qt.ToolButtonTextUnderIcon)
         def std(key, text, slot, tip):
             a = G.QAction(IC.ICONS[key](), text, self); a.setToolTip(tip); a.triggered.connect(lambda _=False: slot()); tb.addAction(a); return a
@@ -761,10 +814,14 @@ class MainWindow(W.QMainWindow):
         std("peaks", "峰分析", lambda: (self.center.setCurrentWidget(self.peaks), self.peaks.find() if self.items else None), "開啟 Peak Analysis：尋峰、峰位、峰高、峰面積、峰比值")
         std("rsd", "RSD", lambda: (self.center.setCurrentWidget(self.rsd), self.rsd.compute() if self.items else None), "開啟 RSD 重現性：標定特徵峰（峰高或區域面積），畫長條圖並計算平均、SD、RSD%")
         std("quant", "定量 / LOD", lambda: (self.center.setCurrentWidget(self.quant), self.quant.load() if self.quant.table.rowCount() != len(self.items) else None), "開啟定量與 LOD 模組")
+        std("ir", "IR 紅外", lambda: self.panel.setCurrentWidget(self.ir), "開啟 IR 功能欄：%T↔Abs、CO₂ 消除、基線校正、特徵峰預測")
         std("integral", "區間積分", lambda: (self.panel.setCurrentWidget(self.analysis_tab), self.compute_bands()), "計算 Analysis 面板中各區間的面積")
         std("fit", "全範圍", self.full_scale, "顯示全部範圍（Ctrl+0）")
         self._update_tips()
         self._equalize_toolbar(tb)
+        self.tb_scroll = WheelStrip(tb); outer.addWidget(self.tb_scroll)
+        self.tb_scroll.fit()
+        C.QTimer.singleShot(0, self.tb_scroll.fit)            # re-measure once real fonts / DPI are applied
 
     def _equalize_toolbar(self, tb):
         """Give every toolbar button the same width / height so icons, labels and borders line up symmetrically."""
@@ -791,9 +848,9 @@ class MainWindow(W.QMainWindow):
                 cx, cy = (bb[0] + bb[2]) / 2 - sz.width() / 2, (bb[1] + bb[3]) / 2 - sz.height() / 2
                 if abs(cx) > 1.0 or abs(cy) > 1.0: problems.append(f"icon off-centre by ({cx:.1f},{cy:.1f}) in {(b.text() or b.toolTip())[:20]!r}")
         tb = self.findChildren(W.QToolBar)
-        main = [t for t in tb if t.objectName() != "ToolStrip"]
+        main = [t for t in tb if t.objectName() not in ("ToolStrip", "MainToolBar")]
         for t in main:
-            sizes = {(b.width(), b.height()) for b in t.findChildren(W.QToolButton) if b.width() > 20 and b.height() > 20}
+            sizes = {(b.width(), b.height()) for b in t.findChildren(W.QToolButton) if b.width() > 20 and b.height() > 20 and b.isVisibleTo(t) and b.objectName() != "qt_toolbar_ext_button"}
             if len(sizes) > 1: problems.append(f"toolbar buttons differ in size: {sorted(sizes)}")
         for b in self.toolbox.findChildren(W.QToolButton):
             if b.width() != b.height(): problems.append("tool-strip button not square")
@@ -935,6 +992,7 @@ class MainWindow(W.QMainWindow):
             self._draw_compare(shown, act)
             self._draw_band(shown)
         self._draw_qc(shown)
+        if hasattr(self, "ir"): self.ir.draw_marks()
         if hasattr(self, "specbar"): self._highlight_selected()
 
     def _add_extra(self, item, ignore_bounds=False):
@@ -1098,12 +1156,15 @@ class MainWindow(W.QMainWindow):
                     it_ = self.add_spectrum(sp); loaded += 1
                     mt = getattr(sp, "meta", None) or {}
                     if mt.get("hidden"): it_.visible = False
-                    elif mt.get("ylabel") and mt.get("xunit") == "nm": self.cb_yunit.setCurrentText(mt["ylabel"])
+                    elif mt.get("ylabel") and (mt.get("xunit") == "nm" or mt.get("ir")): self.cb_yunit.setCurrentText(mt["ylabel"])
                     if notes: report.append(f"{sp.name}：" + "；".join(notes))
             except Exception as ex:
                 report.append(f"✗ {os.path.basename(p)}：無法讀取（{ex}）")
         if not loaded: self.undo.pop(); self._refresh_actions()
+        if loaded and self.items and all(any(h.startswith("ir=") for h in it.spec.history) for it in self.items):
+            self.cb_invx.setChecked(True)                      # IR convention: wavenumber runs high -> low
         self.refresh(); self.full_scale()
+        if hasattr(self, "ir"): self.ir.update_mode()
         self.import_report = report
         if report and not quiet:
             W.QMessageBox.information(self, "匯入報告", f"已載入 {loaded} 條光譜。\n\n" + "\n".join(report[:30]) + ("\n…" if len(report) > 30 else ""))

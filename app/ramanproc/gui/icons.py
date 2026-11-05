@@ -263,6 +263,17 @@ def _rsd(p):
 ICONS["rsd"] = _wrap(_rsd)
 
 
+def _ir(p):
+    _axes(p); p.setPen(_pen(BLUE, 3.5))
+    g = lambda t, c, w, a: a * math.exp(-0.5 * ((t - c) / w) ** 2)
+    p.drawPath(_curve(lambda t: 0.9 - g(t, 0.25, 0.05, 0.55) - g(t, 0.5, 0.12, 0.35) - g(t, 0.75, 0.03, 0.7), base=52, amp=40))
+    p.setPen(_pen(RED, 2.5))
+    for t in (0.25, 0.75):
+        x = 6 + 52 * t; y = 52 - 40 * (0.9 - (0.55 if t < 0.5 else 0.7)); p.drawLine(C.QPointF(x, y + 5), C.QPointF(x, y + 12))
+
+ICONS["ir"] = _wrap(_ir)
+
+
 def _bl_copy(p):
     p.setPen(_pen("#555555", 2.5)); p.setBrush(G.QColor("#ffffff")); p.drawRoundedRect(22, 8, 30, 38, 4, 4)
     p.setBrush(G.QColor("#dbeafe")); p.setPen(_pen(BLUE, 2.5)); p.drawRoundedRect(10, 18, 30, 38, 4, 4)
