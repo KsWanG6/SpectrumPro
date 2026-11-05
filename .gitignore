@@ -1,0 +1,9 @@
+.venv/
+.buildenv/
+.buildenv_mac/
+dist/
+build/
+__pycache__/
+*.pyc
+*.spec
+.pytest_cache/
