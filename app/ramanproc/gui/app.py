@@ -34,6 +34,8 @@ class Item:
         self.group = ""           # user group label
         self.raw = spec           # spectrum as loaded (for before/after comparison)
         self.stage = {}           # {"smooth": Spectrum, "base": (x, y), "pre_base": Spectrum}
+        self.stack_rank = None    # position in the 自動疊 view (None = list order, on top of ranked ones)
+        self.stack_dy = 0.0       # manual extra offset in the 自動疊 view (display only)
 
 
 class WideSample(ItemSample):
@@ -185,6 +187,8 @@ class MainWindow(W.QMainWindow):
         wsrow = W.QHBoxLayout(); wsrow.setContentsMargins(4, 4, 4, 0); wsrow.addWidget(self.wsbar); wsrow.addWidget(wsadd); wsrow.addStretch(1)
         fl.addLayout(wsrow)
         fl.addWidget(self.plot_title)
+        from .stack_bar import StackBar
+        self.stack_gap = 10.0; self.stackbar = StackBar(self); fl.addWidget(self.stackbar)
         row = W.QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0); row.setSpacing(0)
         self.specbar = TH.SpectrumBar()
         self.specbar.clicked.connect(self._bar_clicked); self.specbar.toggled.connect(self._bar_toggled)
@@ -661,6 +665,7 @@ class MainWindow(W.QMainWindow):
 
     def set_view_mode(self, mode):
         self.view_mode = mode
+        if hasattr(self, "stackbar"): self.stackbar.setVisible(mode == "stack")
         self._sync_view_btn(); self.redraw(); self.full_scale()
         self.statusBar().showMessage({"single": "單曲線顯示：只顯示選取的光譜", "multi": "多重曲線顯示",
                                       "stack": "自動疊曲線：只影響顯示，資料未改動"}[mode])
@@ -906,12 +911,13 @@ class MainWindow(W.QMainWindow):
         c = PALETTE[self._color_i % len(PALETTE)]; self._color_i += 1; return c
 
     def _snapshot(self):
-        return [(it.spec, it.color, it.visible, it.group, it.raw, dict(it.stage)) for it in self.items]
+        return [(it.spec, it.color, it.visible, it.group, it.raw, dict(it.stage), it.stack_rank, it.stack_dy) for it in self.items]
 
     def _restore(self, snap):
         self.items = []
-        for sp, col, vis, grp, raw, stg in snap:
+        for sp, col, vis, grp, raw, stg, *stk in snap:
             it = Item(sp, col); it.visible = vis; it.group = grp; it.raw = raw; it.stage = dict(stg); self.items.append(it)
+            if stk: it.stack_rank, it.stack_dy = stk
         self.refresh()
 
     def push_undo(self):
@@ -1012,12 +1018,18 @@ class MainWindow(W.QMainWindow):
         width = self.sp_width.value() if hasattr(self, "sp_width") else 1.5
         show_final = self._opt("cb_final", True); only_mean = self._opt("cb_only_mean")
         shown = []
-        for i, it in enumerate(self.items):
+        if self.view_mode == "stack":
+            from . import stack_bar as SB
+            seq = SB.order(self); stack_off = SB.layout(self, seq)
+            draw_order = seq[::-1] + [i for i in range(len(self.items)) if i not in stack_off]   # legend top -> bottom like the stack
+        else:
+            draw_order = range(len(self.items))
+        for i in draw_order:
+            it = self.items[i]
             if not it.visible or (self.view_mode == "single" and i != act): continue
             shown.append(it)
             y = it.spec.y
-            if self.view_mode == "stack":
-                lo, hi = float(np.nanmin(y)), float(np.nanmax(y)); y = y + (top - lo); top = hi + (top - lo) + 0.1 * (hi - lo)
+            if self.view_mode == "stack": y = y + stack_off[i]
             if not show_final or (only_mean and self.view_mode != "stack"): continue
             c = self.pi.plot(self._xmap(it.spec.x), y, pen=pg.mkPen(it.color, width=width), name=it.spec.name)
             self.curves[id(it)] = c
@@ -1799,6 +1811,7 @@ class MainWindow(W.QMainWindow):
     # ---------------- mouse tools ----------------
     def set_tool(self, tid):
         self.tool = tid
+        if hasattr(self, "stackbar"): self.stackbar.sync_tool(tid)
         vb = self.vb
         vb.setMouseMode(pg.ViewBox.RectMode if tid == T.ZOOM else pg.ViewBox.PanMode)
         self.hline.setVisible(tid == T.XY)
@@ -1839,6 +1852,9 @@ class MainWindow(W.QMainWindow):
 
     def tool_press(self, p0):
         t = self.tool
+        if t == T.SHIFT and self.view_mode == "stack":          # stacked view: Shift = move one curve (display only)
+            from .stack_bar import StackDrag
+            self._drag = {"stack": StackDrag(self, p0)}; return
         self._drag = {"p0": p0}
         if t == T.LABEL_PEAK:
             lab = self._label_at(p0); self._drag["label"] = lab
@@ -1860,6 +1876,7 @@ class MainWindow(W.QMainWindow):
     def tool_move(self, p):
         d = self._drag
         if not d: return
+        if "stack" in d: d["stack"].move(p); return
         t = self.tool
         if t in (T.SHIFT, T.MULTIPLY):
             for i in d["idx"]:
@@ -1888,6 +1905,7 @@ class MainWindow(W.QMainWindow):
     def tool_release(self, p):
         d, self._drag = self._drag, None
         if not d: return
+        if "stack" in d: d["stack"].release(p); return
         t = self.tool
         if t == T.DXLINE:
             self.set_dxlines(d["p0"].x(), p.x()); return
@@ -2018,6 +2036,7 @@ class MainWindow(W.QMainWindow):
             st = self._new_ws_state(w_["name"])
             for d in w_["items"]:
                 it = Item(d["spec"], d["color"]); it.visible, it.group, it.raw = d["visible"], d["group"], d["raw"]; st["items"].append(it)
+                it.stack_rank, it.stack_dy = d.get("stack_rank"), float(d.get("stack_dy", 0.0))
             self.ws_states.append(st)
         self.ws_cur = min(max(current, 0), len(self.ws_states) - 1)
         self.wsbar.blockSignals(True)

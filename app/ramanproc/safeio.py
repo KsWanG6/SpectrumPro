@@ -256,7 +256,8 @@ def save_session(path, workspaces, current=0):
             has_raw = it.raw is not None and it.raw is not it.spec
             if has_raw: arrays[f"rx{n}"], arrays[f"ry{n}"] = it.raw.x, it.raw.y
             rec["items"].append({"k": n, "name": it.spec.name, "color": it.color, "visible": bool(it.visible), "group": it.group,
-                                 "history": [str(h) for h in it.spec.history], "raw": has_raw, "raw_name": it.raw.name if has_raw else ""})
+                                 "history": [str(h) for h in it.spec.history], "raw": has_raw, "raw_name": it.raw.name if has_raw else "",
+                                 "stack_rank": getattr(it, "stack_rank", None), "stack_dy": float(getattr(it, "stack_dy", 0.0))})
             n += 1
         meta["workspaces"].append(rec)
     arrays["meta"] = np.frombuffer(json.dumps(meta, ensure_ascii=False).encode("utf-8"), np.uint8)
@@ -275,6 +276,7 @@ def load_session(path):
             for r in ws["items"]:
                 k = r["k"]; spec = Spectrum(z[f"x{k}"], z[f"y{k}"], r["name"], list(r["history"]))
                 raw = Spectrum(z[f"rx{k}"], z[f"ry{k}"], r.get("raw_name") or r["name"]) if r["raw"] else spec
-                items.append({"spec": spec, "color": r["color"], "visible": r["visible"], "group": r["group"], "raw": raw})
+                items.append({"spec": spec, "color": r["color"], "visible": r["visible"], "group": r["group"], "raw": raw,
+                              "stack_rank": r.get("stack_rank"), "stack_dy": r.get("stack_dy", 0.0)})
             out.append({"name": ws["name"], "items": items})
     return out, int(meta.get("current", 0))
