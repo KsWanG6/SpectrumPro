@@ -2,6 +2,7 @@
 import os, sys, copy
 import numpy as np
 import pyqtgraph as pg
+from pyqtgraph.graphicsItems.LegendItem import ItemSample
 from PySide6 import QtWidgets as W, QtCore as C, QtGui as G
 
 import ramanproc as rp
@@ -33,6 +34,23 @@ class Item:
         self.group = ""           # user group label
         self.raw = spec           # spectrum as loaded (for before/after comparison)
         self.stage = {}           # {"smooth": Spectrum, "base": (x, y), "pre_base": Spectrum}
+
+
+class WideSample(ItemSample):
+    """Legend line sample: twice the default length, drawn with the spectrum's own pen (so it follows the line-width setting)."""
+    LEN = 40
+
+    def __init__(self, item):
+        super().__init__(item); self.setFixedWidth(self.LEN)
+
+    def boundingRect(self):
+        return C.QRectF(0, 0, self.LEN, 20)
+
+    def paint(self, p, *args):
+        if not self.item.isVisible(): return super().paint(p, *args)
+        p.setRenderHint(G.QPainter.Antialiasing)
+        pen = G.QPen(pg.mkPen(self.item.opts["pen"])); pen.setCapStyle(C.Qt.FlatCap); p.setPen(pen)
+        p.drawLine(0, 11, self.LEN, 11)
 
 
 class WheelStrip(W.QScrollArea):
@@ -141,17 +159,17 @@ class MainWindow(W.QMainWindow):
         self.plot = pg.PlotWidget(viewBox=self.vb, axisItems={o: StyledAxis(o) for o in ('bottom', 'left', 'top', 'right')})
         self.pi = self.plot.getPlotItem()
         self.pi.setLabel("bottom", "Raman Shift (cm⁻¹)")
-        self.pi.setLabel("left", "Intensity")
+        self.pi.setLabel("left", "Intensity (a.u.)")
         for _a in ("left", "bottom"): self.pi.getAxis(_a).enableAutoSIPrefix(False)      # never show "(x0.001)" for absorbance etc.
         self.pi.showGrid(x=True, y=True, alpha=0.25)
-        self.legend = self.pi.addLegend(offset=(-10, 10))
+        self.legend = self.pi.addLegend(offset=(-10, 10), sampleType=WideSample)
         dash = pg.mkPen("#888", style=C.Qt.DashLine)
         self.vline = pg.InfiniteLine(angle=90, movable=False, pen=dash)
         self.hline = pg.InfiniteLine(angle=0, movable=False, pen=dash)
         self.pi.addItem(self.vline, ignoreBounds=True); self.pi.addItem(self.hline, ignoreBounds=True)
         self.hline.setVisible(False)
         self.plot.scene().sigMouseMoved.connect(self._mouse_moved)
-        self.plot.viewport().installEventFilter(self); self.installEventFilter(self)     # hide the cursor read-out when the pointer leaves the plot
+        self.plot.installEventFilter(self); self.plot.viewport().installEventFilter(self); self.installEventFilter(self)     # hide the cursor read-out when the pointer leaves the plot
 
         # ---- centre: tabs (Spectra / Data), titled frame ----
         self.center = W.QTabWidget()
@@ -185,6 +203,9 @@ class MainWindow(W.QMainWindow):
         from .rsd_panel import RsdPanel
         self.rsd = RsdPanel(self)
         self.center.insertTab(3, self.rsd, "RSD 重現性")
+        from .map_panel import MapPanel
+        self.mapview = MapPanel(self); self._map_dirty = True
+        self.center.insertTab(4, self.mapview, "Map 影像")
         self.peak_table = self.peaks.table; self.pk_rel = self.peaks.rel; self.pk_dist = self.peaks.dist
         self.center.currentChanged.connect(lambda _: self._fill_data_table())
         self.center.currentChanged.connect(self._center_changed)
@@ -197,6 +218,7 @@ class MainWindow(W.QMainWindow):
             m = W.QMenu(self.toolbox); m.addAction("移除頁面所有標記").triggered.connect(self.clear_all_marks); m.exec(self.toolbox.mapToGlobal(pos))
         self.toolbox.customContextMenuRequested.connect(_tool_menu)
         self.toolbox.toolChanged.connect(self.set_tool)
+        self.toolbox.addScale.connect(self.add_scalebar)
         strip = W.QToolBar("工具"); strip.setObjectName("ToolStrip"); strip.setOrientation(C.Qt.Vertical)
         strip.setMovable(False); strip.addWidget(self.toolbox)
         self.addToolBar(C.Qt.LeftToolBarArea, strip)
@@ -563,11 +585,13 @@ class MainWindow(W.QMainWindow):
         self.cb_invx = W.QCheckBox("X 軸反向")
         self.cb_yunit = W.QComboBox(); self.cb_yunit.setEditable(True)
         self.cb_yunit.addItems(["Intensity", "Intensity (a.u.)", "Intensity (counts)", "Intensity (counts/s)", "Normalized intensity", "Absorbance"])
+        self.cb_yunit.setCurrentText("Intensity (a.u.)")
         self.rng = [W.QDoubleSpinBox() for _ in range(4)]
         for r_ in self.rng: r_.setRange(-1e9, 1e9); r_.setDecimals(3)
         fa.addRow("X 單位", self.cb_axis); fa.addRow("雷射波長（轉換用）", self.sp_laser); fa.addRow(self.cb_invx); fa.addRow("Y 軸單位", self.cb_yunit)
         for lab, r_ in zip(("X 最小", "X 最大", "Y 最小", "Y 最大"), self.rng): fa.addRow(lab, r_)
         w = W.QWidget(); w.setLayout(fa); sa.add(w)
+        bax = W.QPushButton("座標軸設定視窗…"); bax.setToolTip("Scale / 刻度標籤 / 標題 / 格線 / 線與刻度（也可在圖上按右鍵開啟）"); bax.clicked.connect(self.open_axis_dialog); sa.add(bax)
         rb = W.QHBoxLayout()
         b1 = W.QPushButton("套用範圍"); b1.setObjectName("Apply"); b1.clicked.connect(self.apply_range)
         b2 = W.QPushButton("自動範圍"); b2.clicked.connect(self.full_scale)
@@ -577,7 +601,7 @@ class MainWindow(W.QMainWindow):
         lay.addWidget(sa); lay.addStretch(1)
         self.cb_axis.currentIndexChanged.connect(self.set_axis_mode); self.sp_laser.valueChanged.connect(lambda _: self.set_axis_mode())
         self.cb_invx.toggled.connect(lambda c: self.pi.invertX(c))
-        self.cb_yunit.currentTextChanged.connect(lambda t: self.pi.setLabel("left", t or "Intensity"))
+        self.cb_yunit.currentTextChanged.connect(lambda t: self.pi.setLabel("left", t or "Intensity (a.u.)"))
         for r_ in self.rng: r_.editingFinished.connect(self.apply_range)
         self.pi.vb.sigRangeChanged.connect(self._sync_range)
         sa_ = W.QScrollArea(); sa_.setWidgetResizable(True); sa_.setWidget(host); sa_.setHorizontalScrollBarPolicy(C.Qt.ScrollBarAlwaysOff)
@@ -616,10 +640,13 @@ class MainWindow(W.QMainWindow):
         for ax in ("left", "bottom"):
             self.pi.getAxis(ax).setPen(fg); self.pi.getAxis(ax).setTextPen(fg)
         if hasattr(self, "figstyle"): self.figstyle.apply()          # re-colour the frame (Auto = same as the axis lines)
+        if hasattr(self, "mapview"): self.mapview.apply_theme(dark)
 
     def _center_changed(self, i):
         if hasattr(self, "right_dock"):
-            self.right_dock.setVisible(self.center.widget(i) not in (self.quant, self.peaks, self.rsd))   # quantification gets the full width
+            self.right_dock.setVisible(self.center.widget(i) not in (self.quant, self.peaks, self.rsd, self.mapview))   # quantification gets the full width
+        if self.center.widget(i) is getattr(self, "mapview", None) and self._map_dirty:
+            self._map_dirty = False; self.mapview.rebuild()
 
     def _active_idx(self):
         sel = self.selected_idx()
@@ -643,6 +670,7 @@ class MainWindow(W.QMainWindow):
         self._update_info()
         self.specbar.style_buttons(self.items, set(self.selected_idx()))
         self._highlight_selected()
+        if getattr(self, "mapview", None) is not None and self.center.currentWidget() is self.mapview: self.mapview.sync_selection()
 
     def _bar_clicked(self, i, mods):
         it = self.listw.item(i)
@@ -701,6 +729,7 @@ class MainWindow(W.QMainWindow):
         self._act(f, "儲存選取光譜（文字檔）…", self.save_selected, "Ctrl+S")
         self._act(f, "匯出全部（XYY 單一檔）…", self.export_xyy)
         self._act(f, "匯出圖片（PNG / SVG / PDF）…", self.export_image)
+        self._act(f, "複製圖片到剪貼簿", self.copy_figure, "Ctrl+Shift+C")
         f.addSeparator()
         self._act(f, "儲存工作階段…（所有工作區）", self.save_session_dialog)
         self._act(f, "開啟工作階段…", self.open_session_dialog)
@@ -732,6 +761,7 @@ class MainWindow(W.QMainWindow):
         p = mb.addMenu("峰(&P)")
         self._act(p, "峰分析 Peak Analysis…", self.op_peaks)
         self._act(p, "RSD 重現性…", lambda: self.center.setCurrentWidget(self.rsd))
+        self._act(p, "Map 影像（mapping）…", lambda: self.center.setCurrentWidget(self.mapview))
         self._act(p, "清除峰標示", self.clear_labels)
         self._act(p, "移除頁面所有標記", self.clear_all_marks)
         s = mb.addMenu("區間(&S)")
@@ -929,6 +959,9 @@ class MainWindow(W.QMainWindow):
         self.hist_label.setText(f"{len(self.items)} 條光譜")
         self._update_info(); self._fill_data_table()
         self.specbar.rebuild(self.items, set(self.selected_idx())); self._highlight_selected()
+        if getattr(self, "mapview", None) is not None:
+            if self.center.currentWidget() is self.mapview: self._map_dirty = False; self.mapview.rebuild()
+            else: self._map_dirty = True
 
     # ---- display options (Display tab); defaults apply before the tab exists ----
     def _opt(self, name, default=False):
@@ -993,6 +1026,7 @@ class MainWindow(W.QMainWindow):
             self._draw_band(shown)
         self._draw_qc(shown)
         if hasattr(self, "ir"): self.ir.draw_marks()
+        if hasattr(self, "figstyle"): self.figstyle.style_legend()
         if hasattr(self, "specbar"): self._highlight_selected()
 
     def _add_extra(self, item, ignore_bounds=False):
@@ -1090,11 +1124,29 @@ class MainWindow(W.QMainWindow):
     def eventFilter(self, obj, ev):
         t = ev.type()
         try:
+            if obj is self.plot and t == C.QEvent.KeyPress and getattr(self, "_sel_axis_label", None) is not None:
+                k = ev.key(); step = 10 if ev.modifiers() & C.Qt.ShiftModifier else 1
+                d = {C.Qt.Key_Left: (-step, 0), C.Qt.Key_Right: (step, 0), C.Qt.Key_Up: (0, -step), C.Qt.Key_Down: (0, step)}.get(k)
+                if d: self._sel_axis_label.nudge_label(*d); return True
+                if k == C.Qt.Key_Escape: self.select_axis_label(None); return True
+            if obj is self.plot.viewport() and t == C.QEvent.Resize and not getattr(self, "_exporting", False): self._plot_margins()
             if (obj is self.plot.viewport() and t in (C.QEvent.Leave, C.QEvent.Hide)) or (obj is self and t == C.QEvent.WindowDeactivate):
                 self._hide_cursor_marks()      # pointer left the Spectra plot / another tab / the window lost focus (e.g. screenshot tools)
         except RuntimeError:
             pass                               # widgets already deleted while the application shuts down
         return super().eventFilter(obj, ev)
+
+    def select_axis_label(self, ax=None):
+        """Select an axis title (click it): arrow keys then move it by 1 px (Shift: 10 px); Esc / clicking the plot deselects."""
+        for nm in ("bottom", "left"):
+            a_ = self.pi.getAxis(nm); a_.set_label_selected(a_ is ax)
+        self._sel_axis_label = ax
+        if ax is not None: self.plot.setFocus()
+
+    def _plot_margins(self, w=None, h=None):
+        """The spectra plot uses 90 % of the widget (5 % margin on every side): room for the last tick label and thick frame lines."""
+        w = w if w is not None else self.plot.viewport().width(); h = h if h is not None else self.plot.viewport().height()
+        mx, my = int(round(0.05 * w)), int(round(0.05 * h)); self.pi.layout.setContentsMargins(mx, my, mx, my)
 
     def _hide_cursor_marks(self):
         ro = getattr(self, "readout", None)
@@ -1142,7 +1194,7 @@ class MainWindow(W.QMainWindow):
 
     # ---------------- file I/O ----------------
     def open_files(self):
-        paths, _ = W.QFileDialog.getOpenFileNames(self, "開啟光譜", "", "光譜文字檔 (*.txt *.csv *.dat *.xy);;所有檔案 (*)")
+        paths, _ = W.QFileDialog.getOpenFileNames(self, "開啟光譜", "", "光譜檔 (*.txt *.csv *.dat *.xy *.l6s *.l6m);;HORIBA LabSpec 6 (*.l6s *.l6m);;所有檔案 (*)")
         if paths: self.load_paths(paths)
 
     def load_paths(self, paths, quiet=False):
@@ -1153,8 +1205,8 @@ class MainWindow(W.QMainWindow):
         for p in paths:
             try:
                 for sp, notes in safeio.load_spectra(p):
-                    it_ = self.add_spectrum(sp); loaded += 1
                     mt = getattr(sp, "meta", None) or {}
+                    it_ = self.add_spectrum(sp, group=mt.get("group")); loaded += 1
                     if mt.get("hidden"): it_.visible = False
                     elif mt.get("ylabel") and (mt.get("xunit") == "nm" or mt.get("ir")): self.cb_yunit.setCurrentText(mt["ylabel"])
                     if notes: report.append(f"{sp.name}：" + "；".join(notes))
@@ -1201,6 +1253,53 @@ class MainWindow(W.QMainWindow):
         p, _ = W.QFileDialog.getSaveFileName(self, "匯出圖片", "figure.png", "PNG (*.png);;SVG 向量 (*.svg);;PDF 向量 (*.pdf)")
         if p: self.export_figure(p)
 
+    def copy_figure(self):
+        """Copy the figure (same layout / ratio / fonts as Export) to the clipboard as an image."""
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix=".png"); os.close(fd)
+        try:
+            self.export_figure(tmp)
+            img = G.QImage(tmp)
+            if img.isNull(): raise RuntimeError("圖片產生失敗")
+            G.QGuiApplication.clipboard().setImage(img)
+            self.statusBar().showMessage(f"已複製圖片到剪貼簿（{img.width()}×{img.height()} px）")
+        except Exception as ex:
+            W.QMessageBox.warning(self, APP_NAME, f"無法複製圖片：{ex}")
+        finally:
+            try: os.remove(tmp)
+            except OSError: pass
+
+    def reset_legend(self):
+        """Legend can be dragged anywhere in the plot; this puts it back to the top-right corner."""
+        self.legend.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-10, 10))
+
+    def add_scalebar(self):
+        """Origin-style 'Add XY Scale': an L-shaped scale bar (length / title linked to the major tick increment)."""
+        from .scalebar import ScaleBar
+        if getattr(self, "scalebar", None) is None: self.scalebar = ScaleBar(self)
+        self.scalebar.setVisible(True); self.scalebar.refresh()
+        self.statusBar().showMessage("已加入 XY Scale：可拖曳移動，右鍵可調整 Properties")
+        return self.scalebar
+
+    def remove_scalebar(self):
+        sb = getattr(self, "scalebar", None)
+        if sb is not None:
+            try: sb.vb.sigRangeChanged.disconnect(sb.refresh); sb.vb.sigResized.disconnect(sb.refresh)
+            except Exception: pass
+            sb.setParentItem(None); self.pi.scene().removeItem(sb) if sb.scene() is not None else None
+        self.scalebar = None
+
+    def open_scale_dialog(self):
+        from .scalebar import ScaleDialog
+        if getattr(self, "scalebar", None) is None: return
+        if getattr(self, "scale_dialog", None) is None: self.scale_dialog = ScaleDialog(self)
+        self.scale_dialog.open_dialog()
+
+    def open_axis_dialog(self):
+        from .axis_dialog import AxisDialog
+        if getattr(self, "axis_dialog", None) is None: self.axis_dialog = AxisDialog(self)
+        self.axis_dialog.open_dialog()
+
     def export_figure(self, p, width=None, aspect="ui"):
         """Save the plot as currently viewed (zoom, axes, overlays). PNG raster; SVG / PDF vector.
         aspect: "ui" = ratio chosen in Display > Export (default 6:5 like the reference figure), None = keep the window ratio, or a number (w/h)."""
@@ -1211,10 +1310,38 @@ class MainWindow(W.QMainWindow):
         old = (self.plot.minimumSize(), self.plot.maximumSize())
         qc_was = self.cb_qc.isChecked()
         if qc_was: self.cb_qc.setChecked(False)          # QC markers (spike / saturation) are for inspection, not for the figure
+        self.select_axis_label(None)                   # no selection frame in the figure
+        lay = self.pi.layout; old_m = lay.getContentsMargins(); self._exporting = True
+        axes_ = [self.pi.getAxis(n) for n in ("bottom", "top", "left", "right")]
+        for ax_ in axes_:                                # freeze the tick positions seen on screen
+            try: ax_.frozen_levels = None; ax_.frozen_levels = ax_.tickSpacing(ax_.range[0], ax_.range[1], float(ax_.width() if ax_.orientation in ("bottom", "top") else ax_.height()))
+            except Exception: ax_.frozen_levels = None
+        lg = self.legend; lg_pos0 = lg.pos(); vb0 = lg.parentItem().boundingRect(); lgb0 = lg.boundingRect()
+        fl = lg_pos0.x() / max(vb0.width(), 1); ft = lg_pos0.y() / max(vb0.height(), 1)          # legend top-left corner, as a fraction of the plot (kept in the export)
+        transp = self.figstyle.transparent.isChecked() if hasattr(self, "figstyle") else False
+        lg_anchor0 = tuple(getattr(lg, "_GraphicsWidgetAnchor__" + k, None) for k in ("itemAnchor", "parentAnchor", "offset"))     # exact on-screen anchoring, restored afterwards
+        undo_export = []; raster = True; vp_af0 = False
         try:
+            self._plot_margins(); W.QApplication.processEvents()
+            for _ in range(2): self.plot.grab(); W.QApplication.processEvents()          # paint once so axis widths follow the big tick fonts (no title / label overlap)     # thick frame lines are drawn half outside the plot: keep them from being cut at the image edge
             if aspect:                                   # lay the figure out at the target ratio, independent of the window
-                self.plot.setFixedSize(EXPORT_BASE_W, int(round(EXPORT_BASE_W / aspect))); W.QApplication.processEvents()
-            low = p.lower()
+                self.plot.setFixedSize(EXPORT_BASE_W, int(round(EXPORT_BASE_W / aspect))); self._plot_margins(EXPORT_BASE_W, int(round(EXPORT_BASE_W / aspect))); W.QApplication.processEvents()
+                for _ in range(2): self.plot.grab(); W.QApplication.processEvents()
+            low = p.lower(); raster = not (low.endswith(".pdf") or low.endswith(".svg")); scale = 1.0
+            if raster:           # raster export scales the scene; cosmetic curve pens and the legend (ignores transforms) must be scaled by hand
+                scale = float(width) / max(self.pi.boundingRect().width(), 1.0)
+                for c in list(self.curves.values()):
+                    opn = c.opts["pen"]; npn = G.QPen(opn); npn.setWidthF(opn.widthF() * scale); c.setPen(npn); undo_export.append(lambda c=c, opn=opn: c.setPen(opn))
+            WideSample.LEN = 40 * scale
+            for smp, _lab in lg.items: smp.setFixedWidth(int(round(WideSample.LEN))); smp.updateGeometry()
+            self.figstyle.style_legend(scale)
+            for _ in range(3): W.QApplication.processEvents(); lg.layout.activate(); lg.updateSize()          # let the enlarged legend settle before measuring it
+            vb = lg.parentItem().boundingRect(); lw, lh = lg.boundingRect().width(), lg.boundingRect().height()
+            ox = max(0.0, min(fl * vb.width(), vb.width() - lw / scale - 4)); oy = max(0.0, min(ft * vb.height(), vb.height() - lh / scale - 4))     # same top-left spot, kept inside the plot
+            lg.anchor(itemPos=(0, 0), parentPos=(0, 0), offset=(ox, oy))
+            W.QApplication.processEvents()
+            if transp and not raster:                    # vector output: no background fill
+                vp_af0 = self.plot.viewport().autoFillBackground(); self.plot.setBackground(None); self.plot.viewport().setAutoFillBackground(False)
             if low.endswith(".pdf"):
                 w_ = G.QPdfWriter(p); w_.setResolution(96)
                 w_.setPageSize(G.QPageSize(C.QSizeF(self.plot.width() * 72 / 96 + 20, self.plot.height() * 72 / 96 + 20), G.QPageSize.Point))
@@ -1227,12 +1354,23 @@ class MainWindow(W.QMainWindow):
             else:
                 import pyqtgraph.exporters as ex
                 exporter = ex.ImageExporter(self.pi); exporter.parameters()["width"] = int(width)
-                if self.cb_bg.currentIndex() == 0: exporter.parameters()["background"] = "w"
+                if transp: exporter.parameters()["background"] = G.QColor(255, 255, 255, 0)          # transparent PNG
+                elif self.cb_bg.currentIndex() == 0: exporter.parameters()["background"] = "w"
                 exporter.export(p)
         finally:
+            for fn_ in undo_export: fn_()
+            if transp and not raster: self._bg_changed(self.cb_bg.currentIndex()); self.plot.viewport().setAutoFillBackground(vp_af0)
+            WideSample.LEN = 40
+            lay.setContentsMargins(*old_m); self._exporting = False
+            for ax_ in axes_: ax_.frozen_levels = None; ax_.picture = None; ax_.update()
             self.plot.setMinimumSize(old[0]); self.plot.setMaximumSize(old[1])
             if qc_was: self.cb_qc.setChecked(True)
             for w_ in hidden: w_.setVisible(True)
+            for smp, _lab in lg.items: smp.setFixedWidth(40); smp.updateGeometry()
+            self.figstyle.style_legend()
+            for _ in range(3): W.QApplication.processEvents(); lg.layout.activate(); lg.updateSize()                 # normal-size legend settles first,
+            if None not in lg_anchor0: lg.anchor(itemPos=lg_anchor0[0], parentPos=lg_anchor0[1], offset=lg_anchor0[2])
+            else: lg.autoAnchor(lg_pos0)                                                                             # then back to the on-screen spot
             W.QApplication.processEvents()
         self.statusBar().showMessage(f"已匯出 {os.path.basename(p)}")
 

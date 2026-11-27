@@ -122,6 +122,9 @@ def clean_xy(x, y, name="spectrum"):
 def load_spectra(path, base=None):
     """Read a text spectrum file (2 columns, or x1 y1 x2 y2 ... multi-spectrum). Returns [(Spectrum, notes), ...]."""
     base = base or os.path.splitext(os.path.basename(path))[0]
+    from . import l6s as _l6s
+    if path.lower().endswith((".l6s", ".l6m")) or _l6s.is_l6s(path):
+        return _load_l6s(path, base)
     rows, skipped = _numeric_rows(_read_text(path))
     if not rows: raise ValueError("檔案中找不到任何數值資料")
     width = max(set(map(len, rows)), key=list(map(len, rows)).count)       # most common column count
@@ -179,6 +182,39 @@ def load_spectra(path, base=None):
         out.append((s, nts))
     if out and labels and width >= 3 and any(sp.meta["hidden"] for sp, _ in out):
         out[0][1][0] += f"（Y 軸量不同者先隱藏，預設顯示 {pairs[prim][2]}）"
+    return out
+
+
+def _load_l6s(path, base):
+    """HORIBA LabSpec 6 binary file -> [(Spectrum, notes)] (one per spectrum stored in the file)."""
+    from . import l6s as _l6s
+    x, ys, xunit, ylabel, meta = _l6s.read(path)
+    out = []
+    mp = meta.pop("map", None)
+    ext = os.path.splitext(path)[1].lower() or ".l6s"
+    info = ", ".join(f"{k}={v}" for k, v in meta.items())
+    w = len(str(len(ys)))
+    for k, y in enumerate(ys):
+        xx, yy, notes = clean_xy(x, y, base)
+        nm = base if len(ys) == 1 else f"{base}_{k + 1:0{w}d}"
+        pos = None
+        if mp:
+            pos = mp["xy"][k]; nm += f" ({pos[0]:.2f}, {pos[1]:.2f} {mp['unit']})"
+        s = Spectrum(xx, yy, nm)
+        s.history = [f"import({os.path.basename(path)})"] + ([f"xunit={xunit}"] if xunit else []) + \
+                    [f"import-note: {n}" for n in notes] + [f"import-note: HORIBA LabSpec 6 ({ext}) " + info]
+        if pos:                                   # machine-readable (kept through processing and in saved sessions) -> map view
+            s.history.append(f"map={base}|{k}|{mp['nx']}|{mp['ny']}|{pos[0]:.6g}|{pos[1]:.6g}|{mp['unit']}")
+            s.history += [f"mapval={lab}|{float(v[k]):.7g}" for lab, v in mp.get("stored", [])]
+        s.meta = {"xunit": xunit, "ylabel": ylabel, "ir": None, "hidden": False, "l6s": meta}
+        if len(ys) > 1: s.meta["group"] = base
+        if pos: s.meta["map_xy"] = pos
+        if k == 0:
+            head = f"HORIBA LabSpec 6 原檔：{len(xx)} 點" + (f"，{meta['Title']}" if meta.get("Title") else "")
+            if mp: head += f"；mapping {mp['nx']}×{mp['ny']} = {len(ys)} 條光譜（{mp['unit']}），已放在群組「{base}」，可在「Map 影像」分頁看影像"
+            elif len(ys) > 1: head += f"；共 {len(ys)} 條光譜"
+            notes = [head] + notes
+        out.append((s, notes))
     return out
 
 

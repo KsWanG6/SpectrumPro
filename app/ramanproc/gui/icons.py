@@ -274,6 +274,14 @@ def _ir(p):
 ICONS["ir"] = _wrap(_ir)
 
 
+def _scale(p):
+    p.setPen(_pen("#222", 3.5))
+    p.drawLine(C.QPointF(14, 10), C.QPointF(14, 48)); p.drawLine(C.QPointF(14, 48), C.QPointF(52, 48))
+    for a, b in (((8, 10), (20, 10)), ((8, 48), (20, 48)), ((52, 42), (52, 54))): p.drawLine(C.QPointF(*a), C.QPointF(*b))
+
+ICONS["tool_scale"] = _wrap(_scale)
+
+
 def _bl_copy(p):
     p.setPen(_pen("#555555", 2.5)); p.setBrush(G.QColor("#ffffff")); p.drawRoundedRect(22, 8, 30, 38, 4, 4)
     p.setBrush(G.QColor("#dbeafe")); p.setPen(_pen(BLUE, 2.5)); p.drawRoundedRect(10, 18, 30, 38, 4, 4)

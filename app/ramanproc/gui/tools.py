@@ -27,6 +27,7 @@ TOOL_TIPS = {
     CURSOR: "點一下：吸附到最近的資料點並標示 X、Y",
     TEXT: "點一下放置文字（可拖曳移動）",
     IMAGE: "點一下選擇圖片檔並放置在圖上",
+    "scale": "在圖上加入 XY Scale（L 形比例尺）：長度與標題連動座標軸 Major tick 設定值；可拖曳移動，對它按右鍵可調整 Properties",
     DRAW_STRIP: "按住拖曳畫出區間（可多個）",
     REMOVE_STRIP: "點擊區間內部以移除該區間",
     LABEL_PEAK: "點擊峰附近：標示附近最高點的 X 位置；點已有的標示＝刪除；拖曳標示＝移動位置",
@@ -37,6 +38,11 @@ class ToolViewBox(pg.ViewBox):
     def __init__(self, win):
         super().__init__()
         self.win = win
+        self.menu.addSeparator()
+        a = self.menu.addAction("複製圖片到剪貼簿"); a.triggered.connect(lambda: self.win.copy_figure())
+        a = self.menu.addAction("圖例位置還原（右上角）"); a.triggered.connect(lambda: self.win.reset_legend())
+        a = self.menu.addAction("座標軸設定…（Scale／刻度／標題／格線）"); a.triggered.connect(lambda: self.win.open_axis_dialog())
+        a = self.menu.addAction("加入 XY Scale"); a.triggered.connect(lambda: self.win.add_scalebar())
         self.menu.addSeparator(); a = self.menu.addAction("移除頁面所有標記"); a.triggered.connect(lambda: self.win.clear_all_marks())
 
     def mouseDragEvent(self, ev, axis=None):
@@ -56,6 +62,7 @@ class ToolViewBox(pg.ViewBox):
         super().mouseDragEvent(ev, axis)
 
     def mouseClickEvent(self, ev):
+        if ev.button() == C.Qt.LeftButton and getattr(self.win, "_sel_axis_label", None) is not None: self.win.select_axis_label(None)
         if ev.button() == C.Qt.LeftButton and self.win.tool in CLICK_TOOLS:
             ev.accept()
             self.win.tool_click(self.mapToView(ev.pos()))
@@ -66,11 +73,12 @@ class ToolViewBox(pg.ViewBox):
 class Toolbox(W.QWidget):
     """Vertical icon strip (LabSpec-style). One exclusive group of checkable tool buttons."""
     toolChanged = C.Signal(str)
+    addScale = C.Signal()
 
     LAYOUT = [
         [("X 標線", XLINE), ("雙 X 標線（一次標兩條）", DXLINE), ("框選區間", DRAW_STRIP), ("十字線 XY", XY), ("放大", ZOOM),
          ("移動 Y 軸（Shift）", SHIFT), ("移動全圖（平移）", POINTER), ("標文字", TEXT), ("標峰值", LABEL_PEAK), ("橡皮擦（去宇宙射線）", ERASER), ("手動基線（加點）", BASELINE)],
-        [("Multiply", MULTIPLY), ("資料點游標", CURSOR), ("插入圖片", IMAGE), ("移除區間", REMOVE_STRIP)],
+        [("Multiply", MULTIPLY), ("資料點游標", CURSOR), ("插入圖片", IMAGE), ("移除區間", REMOVE_STRIP), ("加入 XY Scale", "scale")],
     ]
 
     def __init__(self):
@@ -87,6 +95,8 @@ class Toolbox(W.QWidget):
                 b = W.QToolButton(); b.setCheckable(True); b.setAutoRaise(True)
                 b.setIcon(IC.ICONS["tool_" + tid]()); b.setIconSize(C.QSize(26, 26)); b.setFixedSize(36, 36)
                 b.setToolTip(f"<b>{text}</b><br>{TOOL_TIPS[tid]}")
+                if tid == "scale":                      # one-shot action, not a mouse mode
+                    b.setCheckable(False); b.clicked.connect(lambda _=False: self.addScale.emit()); lay.addWidget(b); continue
                 b.clicked.connect(lambda _=False, t=tid: self.select(t))
                 self.group.addButton(b); lay.addWidget(b)
                 self.buttons.setdefault(tid, []).append(b)
